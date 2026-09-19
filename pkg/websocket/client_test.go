@@ -390,3 +390,50 @@ func TestClientNotifyExpiredDoesNotBlockWithoutConsumer(t *testing.T) {
 		require.FailNow(t, "Run leaked a goroutine parked on NotifyExpired")
 	}
 }
+
+// Run's reconnect loop calls Stop on cancellation and proxy.Run calls it again
+// on the way out, so close(c.done) must not run twice.
+func TestClientStopIsIdempotent(t *testing.T) {
+	client := NewClient(
+		"ws://127.0.0.1:1",
+		"websocket-random-id",
+		"webhook-payloads",
+		&Config{},
+	)
+
+	client.Stop()
+	client.Stop()
+}
+
+// Canceling the context between connection attempts must unwind Run rather
+// than leave it retrying forever.
+func TestClientRunReturnsWhenCanceledWhileDisconnected(t *testing.T) {
+	// Port 1 refuses connections, so every attempt fails and Run stays in
+	// its reconnect loop.
+	client := NewClient(
+		"ws://127.0.0.1:1",
+		"websocket-random-id",
+		"webhook-payloads",
+		&Config{
+			NoWSS:              true,
+			ConnectAttemptWait: 1 * time.Millisecond,
+		},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		client.Run(ctx)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "Run did not return after its context was canceled")
+	}
+}

@@ -105,6 +105,7 @@ type Client struct {
 	// arrive later bail out instead of touching a closed channel.
 	sendClosing   chan struct{}
 	sendCloseOnce sync.Once
+	stopOnce      sync.Once
 }
 
 func (c *Client) setIsConnected(newValue bool) {
@@ -173,7 +174,10 @@ func (c *Client) Run(ctx context.Context) {
 			}
 			select {
 			case <-ctx.Done():
+				// Canceled between connection attempts. Unwind instead of
+				// retrying, matching the expired-session branch above.
 				c.Stop()
+				return
 			case <-time.After(c.cfg.ConnectAttemptWait):
 			}
 			err = c.connect(ctx)
@@ -259,8 +263,13 @@ func (c *Client) Close(closeCode int, text string) {
 }
 
 // Stop stops listening for incoming webhook events.
+//
+// Safe to call more than once: Run's reconnect loop calls it on cancellation
+// and proxy.Run calls it again on the way out.
 func (c *Client) Stop() {
-	close(c.done)
+	c.stopOnce.Do(func() {
+		close(c.done)
+	})
 }
 
 // closeSend closes c.send, which is what tells writePump to send its close
