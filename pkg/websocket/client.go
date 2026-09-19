@@ -96,6 +96,14 @@ type Client struct {
 	stopReadPump      chan struct{}
 	stopWritePump     chan struct{}
 	wg                *sync.WaitGroup
+
+	// sendMu guards the close of c.send. SendMessage holds it for reading so
+	// that closeSend cannot close the channel underneath an in-flight send.
+	sendMu sync.RWMutex
+	// sendClosing is closed just before closeSend takes sendMu for writing,
+	// which releases any sender parked on a full c.send and lets senders that
+	// arrive later bail out instead of touching a closed channel.
+	sendClosing chan struct{}
 }
 
 func (c *Client) setIsConnected(newValue bool) {
@@ -149,7 +157,16 @@ func (c *Client) Run(ctx context.Context) {
 					c.Stop()
 					return
 				case <-time.After(c.cfg.ConnectAttemptWait):
-					c.NotifyExpired <- struct{}{}
+					// Report the expired session, but do not park here
+					// indefinitely: proxy.Run and tailer.Run both stop
+					// receiving on NotifyExpired once their own context is
+					// canceled, which would strand this goroutine.
+					select {
+					case c.NotifyExpired <- struct{}{}:
+					case <-ctx.Done():
+					case <-c.done:
+					}
+
 					return
 				}
 			}
@@ -163,11 +180,11 @@ func (c *Client) Run(ctx context.Context) {
 
 		select {
 		case <-ctx.Done():
-			close(c.send)
+			c.closeSend()
 			c.Close(ws.CloseNormalClosure, "Connection Done")
 			return
 		case <-c.done:
-			close(c.send)
+			c.closeSend()
 			close(c.NotifyExpired)
 			c.Close(ws.CloseNormalClosure, "Connection Done")
 			return
@@ -245,9 +262,45 @@ func (c *Client) Stop() {
 	close(c.done)
 }
 
+// closeSend closes c.send, which is what tells writePump to send its close
+// frame and stop. It first closes sendClosing to release any sender parked on
+// a full buffer, then waits on sendMu for in-flight sends to return, so the
+// close can never land underneath one.
+//
+// Run reaches this from two mutually exclusive select branches that each
+// return, so it runs at most once per client.
+func (c *Client) closeSend() {
+	close(c.sendClosing)
+
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
+	close(c.send)
+}
+
 // SendMessage sends a message to Stripe through the websocket.
+//
+// Event handlers call this from the read pump's goroutines, concurrently with
+// the shutdown in Run that closes c.send. Once shutdown has begun the message
+// is dropped: the connection is going away and no writePump is left to deliver
+// it.
 func (c *Client) SendMessage(msg *OutgoingMessage) {
-	c.send <- msg
+	c.sendMu.RLock()
+	defer c.sendMu.RUnlock()
+
+	// Checked before the send below because once c.send is closed, a select
+	// offering both a send on it and a ready sendClosing would still choose
+	// the send half the time, and panic.
+	select {
+	case <-c.sendClosing:
+		return
+	default:
+	}
+
+	select {
+	case c.send <- msg:
+	case <-c.sendClosing:
+	}
 }
 
 func readWSConnectErrorMessage(resp *http.Response) string {
@@ -495,7 +548,7 @@ func (c *Client) writePump() {
 				}
 
 				// Requeue the message to be processed when writePump restarts
-				c.send <- outMsg
+				c.SendMessage(outMsg)
 
 				select {
 				case <-c.stopWritePump:
@@ -609,6 +662,7 @@ func NewClient(url string, webSocketID string, websocketAuthorizedFeature string
 		cfg:                        cfg,
 		done:                       make(chan struct{}),
 		send:                       make(chan *OutgoingMessage, 10),
+		sendClosing:                make(chan struct{}),
 		NotifyExpired:              make(chan struct{}),
 	}
 }
